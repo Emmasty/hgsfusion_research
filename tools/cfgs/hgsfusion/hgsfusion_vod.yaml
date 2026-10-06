@@ -94,6 +94,7 @@ MODEL:
                 FEATURE_NUM: 4
                 FUSE_MODE: CONCAT
                 OUT_CHANNELS: 128
+                USE_CHECKPOINT: True
                 SAMPLER: {
                     "mode": "bilinear",
                     "padding_mode": "zeros"

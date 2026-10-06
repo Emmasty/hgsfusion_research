@@ -49,17 +49,21 @@ class PillarNet(nn.Module):
         return 64
 
     def forward(self, batch_dict):
-        batch_size = batch_dict['points'][:,0].max().item()
-        points = []
-        for i in range(int(batch_size)+1):
-            mask = batch_dict['points'][:,0]==i
-            points.append(batch_dict['points'][mask][:,1:])
-            
-        input_dict = dict(points=points)
-        sp_tensor = self.reader(input_dict)
-        features_backbone = self.backbone(sp_tensor)
-        if self.output_spatial_feature:
-            batch_dict['spatial_features_2d'] = self.neck(features_backbone)
-        else:
-            batch_dict['pillar_features_scattered'] = self.neck(features_backbone) # [2, 128, 160, 160]
+        # The custom pillar CUDA scatter kernels only support float32. Keep the
+        # radar branch in FP32 when the outer training loop enables AMP; the
+        # memory-heavy image/voxel branch remains under autocast.
+        with torch.cuda.amp.autocast(enabled=False):
+            batch_size = batch_dict['points'][:,0].max().item()
+            points = []
+            for i in range(int(batch_size)+1):
+                mask = batch_dict['points'][:,0]==i
+                points.append(batch_dict['points'][mask][:,1:].float())
+
+            input_dict = dict(points=points)
+            sp_tensor = self.reader(input_dict)
+            features_backbone = self.backbone(sp_tensor)
+            if self.output_spatial_feature:
+                batch_dict['spatial_features_2d'] = self.neck(features_backbone)
+            else:
+                batch_dict['pillar_features_scattered'] = self.neck(features_backbone) # [2, 128, 160, 160]
         return batch_dict

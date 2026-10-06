@@ -2,6 +2,7 @@ import _init_path
 import argparse
 import datetime
 import glob
+import numbers
 import os
 
 import re
@@ -17,6 +18,31 @@ from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_f
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network
 from pcdet.utils import common_utils
+
+
+def add_scalar_dict(tb_log, metrics, step, prefix=''):
+    """Write nested evaluation metrics to TensorBoard as scalar tags."""
+    for key, value in metrics.items():
+        tag = f'{prefix}/{key}' if prefix else str(key)
+
+        if isinstance(value, dict):
+            add_scalar_dict(tb_log, value, step, prefix=tag)
+            continue
+
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                raise ValueError(f'TensorBoard metric {tag} is not scalar: shape={tuple(value.shape)}')
+            value = value.item()
+        elif isinstance(value, np.ndarray):
+            if value.size != 1:
+                raise ValueError(f'TensorBoard metric {tag} is not scalar: shape={value.shape}')
+            value = value.item()
+        elif isinstance(value, np.generic):
+            value = value.item()
+
+        if not isinstance(value, numbers.Number):
+            raise TypeError(f'TensorBoard metric {tag} has unsupported type: {type(value)}')
+        tb_log.add_scalar(tag, value, step)
 
 
 def parse_config():
@@ -127,13 +153,17 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
         )
 
         if cfg.LOCAL_RANK == 0:
-            for key, val in tb_dict.items():
-                tb_log.add_scalar(key, val, cur_epoch_id)
+            add_scalar_dict(tb_log, tb_dict, cur_epoch_id)
 
-        # record this epoch which has been evaluated
-        with open(ckpt_record_file, 'a') as f:
-            print('%s' % cur_epoch_id, file=f)
-        logger.info('Epoch %s has been evaluated' % cur_epoch_id)
+            # Only rank 0 updates the shared record. Other ranks can finish
+            # eval_one_epoch earlier because AP calculation runs on rank 0.
+            with open(ckpt_record_file, 'a') as f:
+                print('%s' % cur_epoch_id, file=f)
+            logger.info('Epoch %s has been evaluated' % cur_epoch_id)
+
+        # Keep all ranks on the same checkpoint before selecting the next one.
+        if dist_test:
+            torch.distributed.barrier()
 
 
 def main():

@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .frustum_grid_generator import FrustumGridGenerator
 from .sampler import Sampler
@@ -35,14 +37,63 @@ class FrustumToVoxelMultiScale(nn.Module):
         self.fuse_mode = fuse_mode
         self.in_channels = in_channels * feature_num
         self.out_channels = out_channels
+        self.use_checkpoint = self.model_cfg.get('USE_CHECKPOINT', False)
         if self.fuse_mode == 'CONCAT':
             assert self.in_channels is not None
             assert self.out_channels is not None
             self.channel_reduce = nn.Sequential(
                 nn.Conv3d(self.in_channels, self.out_channels, (1, 1, 1)),
                 nn.BatchNorm3d(num_features=self.out_channels),
-                nn.ReLU()
+                nn.ReLU(inplace=True)
             )
+
+    def sample_and_project_feature(self, grid, feature, weight, bias):
+        if not self.use_depth:
+            feature = feature.unsqueeze(2)
+        sampled = self.sampler(input_features=feature, grid=grid).permute(0, 1, 4, 3, 2)
+        return F.conv3d(sampled, weight, bias=bias)
+
+    def sample_and_project_concat(self, grid, *features):
+        """Checkpoint each scale so backward rebuilds one voxel volume at a time."""
+        conv = self.channel_reduce[0]
+        reduced = None
+        channel_offset = 0
+        use_checkpoint = self.use_checkpoint and self.training and torch.is_grad_enabled()
+
+        for feature in features:
+            channel_count = feature.shape[1]
+            weight = conv.weight[:, channel_offset:channel_offset + channel_count]
+            bias = conv.bias if reduced is None else None
+            if use_checkpoint:
+                part = checkpoint(
+                    self.sample_and_project_feature,
+                    grid,
+                    feature,
+                    weight,
+                    bias,
+                    preserve_rng_state=False,
+                )
+            else:
+                part = self.sample_and_project_feature(grid, feature, weight, bias)
+
+            if reduced is None:
+                reduced = part
+            else:
+                reduced.add_(part)
+                del part
+            channel_offset += channel_count
+
+        if channel_offset != conv.in_channels:
+            raise RuntimeError(
+                f'Expected {conv.in_channels} concatenated channels, got {channel_offset}'
+            )
+        return reduced
+
+    def finish_concat_features(self, reduced):
+        # BatchNorm must stay outside checkpointing: recomputation during
+        # backward must not update its running statistics a second time.
+        norm, activation = self.channel_reduce[1], self.channel_reduce[2]
+        return activation(norm(reduced))
 
     def forward(self, batch_dict):
         """
@@ -74,27 +125,28 @@ class FrustumToVoxelMultiScale(nn.Module):
         # batch_dict["features"][3][0, 0, :, :] = 0
         # batch_dict["features"][3][0, 0, 25:35, 110:130] = 1
 
-        if self.use_depth:
-            voxel_features = []
-            for i in range(self.feature_num):
-                voxel_features.append(
-                    self.sampler(input_features=batch_dict["frustum_features"][i], 
-                                 grid=grid).permute(0, 1, 4, 3, 2)
-                )
-            batch_dict.pop('frustum_features')
+        source_key = "frustum_features" if self.use_depth else "features"
+        source_features = batch_dict[source_key]
+
+        if self.fuse_mode == 'CONCAT':
+            reduced = self.sample_and_project_concat(grid, *source_features)
+            voxel_features = self.finish_concat_features(reduced)
         else:
             voxel_features = []
-            for i in range(self.feature_num):
-                B, C, W, H = batch_dict["features"][i].shape
-                voxel_features.append(self.sampler(input_features=batch_dict["features"][i].reshape([B, C, 1, W, H]), 
-                                            grid=grid).permute(0, 1, 4, 3, 2)) # [B, 64, 31, 320, 320]
+            for feature in source_features:
+                if not self.use_depth:
+                    feature = feature.unsqueeze(2)
+                voxel_features.append(
+                    self.sampler(input_features=feature, grid=grid).permute(0, 1, 4, 3, 2)
+                )
+
+        if self.use_depth:
+            batch_dict.pop('frustum_features')
+
         if self.fuse_mode == 'ADD':
             voxel_features = torch.stack(voxel_features) # [4,1,64,31,320,320]
             voxel_features = torch.sum(voxel_features, dim=0) # [1,64,31,320,320]
-        elif self.fuse_mode == 'CONCAT':
-            voxel_features = torch.concat(voxel_features, dim=1)# [1,256,31,320,320]
-            voxel_features = self.channel_reduce(voxel_features)# [1,128,31,320,320]
-        else: 
+        elif self.fuse_mode != 'CONCAT':
             raise NotImplementedError
         
         # print("debug")

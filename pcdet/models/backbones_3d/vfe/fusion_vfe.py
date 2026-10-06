@@ -5,21 +5,16 @@ from .vfe_template import VFETemplate
 from .image_vfe_modules import ffn, f2v
 from .image_vfe import ImageVFE
 from .pillar_vfe import Radar7PillarVFE
-from .feature_sampler import GaussianSampler
 from .simple_sampler import SimpleSampler
 from .radar_occupancy import RadarOccupancy
-from .radar_occupancy_2d import RadarOccupancy2D
 from .radar_occupancy_2d_v2 import RadarOccupancy2DV2
-from .foreground_sampler import ForegroundSampler
 
 radar_occupancy = {
     'RadarOccupancy': RadarOccupancy,
-    'RadarOccupancy2D': RadarOccupancy2D,
     'RadarOccupancy2DV2': RadarOccupancy2DV2
 }
 
 feature_sampler = {
-    'GaussianSampler': GaussianSampler,
     'SimpleSampler': SimpleSampler,
 }
 
@@ -41,7 +36,19 @@ class FusionVFE(nn.Module):
         self.add_module('RadarVFE', RadarVFE)
 
         if self.model_cfg.get('ImageFeatureSampler', None) is not None:
-            self.image_features_sampler = feature_sampler[self.model_cfg.ImageFeatureSampler.NAME](
+            sampler_name = self.model_cfg.ImageFeatureSampler.NAME
+            if sampler_name == 'GaussianSampler':
+                try:
+                    from .feature_sampler import GaussianSampler
+                except ModuleNotFoundError as exc:
+                    raise ModuleNotFoundError(
+                        'ImageFeatureSampler=GaussianSampler requires the missing '
+                        'pcdet.models.backbones_3d.vfe.feature_sampler module.'
+                    ) from exc
+                sampler_cls = GaussianSampler
+            else:
+                sampler_cls = feature_sampler[sampler_name]
+            self.image_features_sampler = sampler_cls(
                                                     self.model_cfg.ImageFeatureSampler,
                                                     point_cloud_range=point_cloud_range,
                                                     voxel_size=self.voxel_size,
@@ -53,7 +60,19 @@ class FusionVFE(nn.Module):
             self.use_image_sampler = False
 
         if self.model_cfg.get('RadarOccupancy', None) is not None:
-            self.radar_occupancy = radar_occupancy[self.model_cfg.RadarOccupancy.NAME](
+            occupancy_name = self.model_cfg.RadarOccupancy.NAME
+            if occupancy_name == 'RadarOccupancy2D':
+                try:
+                    from .radar_occupancy_2d import RadarOccupancy2D
+                except ModuleNotFoundError as exc:
+                    raise ModuleNotFoundError(
+                        'RadarOccupancy2D is configured, but the '
+                        'pcdet.models.backbones_3d.vfe.radar_occupancy_2d module is missing.'
+                    ) from exc
+                occupancy_cls = RadarOccupancy2D
+            else:
+                occupancy_cls = radar_occupancy[occupancy_name]
+            self.radar_occupancy = occupancy_cls(
                 model_cfg=self.model_cfg.RadarOccupancy,
                 point_cloud_range=point_cloud_range,
                 voxel_size=voxel_size,
@@ -67,6 +86,13 @@ class FusionVFE(nn.Module):
             self.use_radar_occupancy = False
 
         if self.model_cfg.get('ForegroundSampler', None) is not None:
+            try:
+                from .foreground_sampler import ForegroundSampler
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    'ForegroundSampler is configured, but the '
+                    'pcdet.models.backbones_3d.vfe.foreground_sampler module is missing.'
+                ) from exc
             self.fore_sampler = ForegroundSampler(
                 model_cfg=self.model_cfg.ForegroundSampler,
                 point_cloud_range=point_cloud_range,

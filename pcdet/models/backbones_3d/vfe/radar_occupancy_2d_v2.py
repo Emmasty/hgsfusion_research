@@ -67,6 +67,38 @@ class Conv2DCollapse(nn.Module):
                                   out_channels=self.num_bev_features,
                                   **self.model_cfg.ARGS)
 
+    def collapse_in_channel_chunks(self, voxel_features, channel_chunk_size=16):
+        """Collapse CxZ into BEV without one extremely wide cuDNN convolution."""
+        conv = self.block.conv
+        if conv.groups != 1:
+            raise NotImplementedError('Chunked BEV collapse requires groups=1')
+
+        _, channels, heights, _, _ = voxel_features.shape
+        collapsed = None
+        for channel_start in range(0, channels, channel_chunk_size):
+            channel_end = min(channel_start + channel_chunk_size, channels)
+            feature_chunk = voxel_features[:, channel_start:channel_end].flatten(1, 2)
+            weight_start = channel_start * heights
+            weight_end = channel_end * heights
+            weight = conv.weight[:, weight_start:weight_end]
+            part = F.conv2d(
+                feature_chunk,
+                weight,
+                bias=conv.bias if collapsed is None else None,
+                stride=conv.stride,
+                padding=conv.padding,
+                dilation=conv.dilation,
+                groups=1,
+            )
+            collapsed = part if collapsed is None else collapsed + part
+
+        expected_channels = channels * heights
+        if expected_channels != conv.in_channels:
+            raise RuntimeError(
+                f'Expected {conv.in_channels} collapsed channels, got {expected_channels}'
+            )
+        return self.block.relu(self.block.bn(collapsed))
+
     def forward(self, batch_dict):
         """
         Collapses voxel features to BEV via concatenation and channel reduction
@@ -78,8 +110,7 @@ class Conv2DCollapse(nn.Module):
                 spatial_features: (B, C, Y, X), BEV feature representation
         """
         voxel_features = batch_dict["voxel_features"] # [2, 64, 31, 320, 320]
-        bev_features = voxel_features.flatten(start_dim=1, end_dim=2)  # (B, C, Z, Y, X) -> (B, C*Z, Y, X)
-        bev_features = self.block(bev_features)  # (B, C*Z, Y, X) -> (B, C, Y, X)
+        bev_features = self.collapse_in_channel_chunks(voxel_features)
         batch_dict["spatial_features"] = bev_features # [2, 64, 320, 320]
         return batch_dict
 

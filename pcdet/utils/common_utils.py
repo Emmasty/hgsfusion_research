@@ -200,8 +200,9 @@ def init_dist_pytorch(tcp_port, local_rank, backend='nccl'):
         # rank=local_rank,
         # world_size=num_gpus
     )
+    world_size = dist.get_world_size()
     rank = dist.get_rank()
-    return num_gpus, rank
+    return world_size, rank
 
 
 def get_dist_info(return_gpu_per_machine=False):
